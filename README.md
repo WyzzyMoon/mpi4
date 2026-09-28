@@ -1,5 +1,8 @@
 # Mπ4 Media Player
 
+<img width="300" height="300" alt="splash" src="https://github.com/user-attachments/assets/e94950a3-2bb2-474b-bc61-dbf8e151a69b" />
+
+
 ## Mediaplayer for Raspberry Pi
 
 **Mπ4** is a simple, very configurable media player for Raspberry Pi (3b+ and up). Designed for easy-to-use video playback in art installation. Heavily inspired by [MP4MUSEUM](https://www.mp4museum.org) by Julius Schmiedel.
