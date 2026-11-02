@@ -1,40 +1,59 @@
 # ----- Mπ4 Media Player -----
-# V1.0b3
+# V1-rc1
 # by Wikke Andeweg
 # www.mpi4.org
 # 2026
 
 import os, glob, subprocess, threading, time, configparser, socket, json, warnings, re
+
+from fnmatch import fnmatchcase
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+from pythonosc.dispatcher import Dispatcher
+from pythonosc.osc_server import ThreadingOSCUDPServer
 from gpiozero import Button as GPIOButton
 from gpiozero.mixins import CallbackSetToNone
+
 warnings.filterwarnings('ignore', category=CallbackSetToNone)
 
 # ---- HARDWARE DETECTION ----
 
+#Get HDMI, Serial, Audio card and pi version
 _hdmi = subprocess.run(['mpv', '--drm-connector=help'], capture_output=True, text=True).stdout
-USE_COMPOSITE = 'HDMI-A-1 (connected)' not in _hdmi and 'HDMI-A-2 (connected)' not in _hdmi
+_serial = open('/proc/device-tree/serial-number').read().strip('\x00')
+_model = int(open('/proc/device-tree/model').read().strip('\x00').split()[2])
+_cards = {m[2]: int(m[1]) for m in re.finditer(r'^card (\d+): (\S+)', subprocess.run(['aplay', '-l'], capture_output=True, text=True).stdout, re.M)}
+
+#Detect if HDMI is preset
+USE_COMPOSITE = not re.search(r'HDMI.*\bconnected', _hdmi)
+
+#Force Composite output if no HDMI is detected
 if USE_COMPOSITE:
-    force_path = subprocess.run(['sudo', 'find', '/sys/kernel/debug/dri', '-name', 'Composite-1'],
-                                 capture_output=True, text=True).stdout.strip().split('\n')[0]
+    force_path = subprocess.run(['sudo', 'find', '/sys/kernel/debug/dri', '-name', 'Composite-1'],capture_output=True, text=True).stdout.strip().split('\n')[0]
     if force_path:
         subprocess.run(f"echo on | sudo tee {force_path}/force", shell=True)
 
-CARDS = [line.split(':')[1].strip().split()[0] for line in subprocess.run("aplay -l | grep '^card'", shell=True, capture_output=True, text=True).stdout.splitlines()]
-
 AUDIO_DEVICES = {
-    'headphones': f'alsa/plughw:{CARDS.index("Headphones")},0' if "Headphones" in CARDS else None,
-    'hdmi0':      f'alsa/plughw:{next((i for i,c in enumerate(CARDS) if "vc4hdmi0" in c or ("vc4hdmi" in c and "vc4hdmi1" not in c)), None)},0',
-    'hdmi1':      f'alsa/plughw:{next((i for i,c in enumerate(CARDS) if "vc4hdmi1" in c), None)},0',
+    'headphones': f'alsa/plughw:{_cards["Headphones"]},0' if "Headphones" in _cards else None,
+    'hdmi0':      f'alsa/plughw:{_cards.get("vc4hdmi0", _cards.get("vc4hdmi"))},0',
+    'hdmi1':      f'alsa/plughw:{_cards["vc4hdmi1"]},0' if "vc4hdmi1" in _cards else None,
 }
 
-VIDEO_EXTS     = {'.mp4', '.mkv', '.avi', '.mov', '.m4v', '.webm'}
+DEFAULT_NAME = 'mpi4-' + _serial[-4:]
+
+VIDEO_EXTS     = {'.mp4', '.mkv', '.avi', '.mov', '.m4v', '.webm', '.ts', '.mpeg','.wmv','.flv','.3gp'}
 IMAGE_EXTS     = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-AUDIO_EXTS     = {'.mp3', '.wav'}
-DEFAULT_IMAGE_DURATION = 10 
+AUDIO_EXTS     = {'.mp3', '.wav','.flac','.ogg','.opus','.m4a','.aac'}
 POLL_INTERVAL  = 5
+
+STATUS_PORT = 5005     # UDP broadcast: status of every player
+OSC_PORT    = 8000     # UDP: OSC control in
+HTTP_PORT   = 8080     # TCP: web page + API
+OBSERVED    = ['time-pos', 'duration', 'pause', 'path', 'idle-active', 'playlist-count']
 
 NOMEDIA_IMAGE = '/home/pi/nomediapal.png' if USE_COMPOSITE else '/home/pi/nomedia.png'
 DEFAULT_CONFIG_PATH = '/boot/firmware/default.mpi4' 
+HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web.html')
 
 # ---- GPIO ----
 
@@ -56,55 +75,30 @@ def load_config():
 
     audio = config.get('player', 'audio_device', fallback='headphones')
     audio = 'hdmi0' if audio == 'hdmi' else audio
-    image_duration = config.getint('player', 'image_duration', fallback=DEFAULT_IMAGE_DURATION)
+    image_duration = config.getint('player', 'image_duration', fallback=10)
     rotation = config.getint('player', 'rotation', fallback=0)
+    force_rotation = config.getboolean('player', 'force_rotation', fallback=False)
     autoplay = config.getboolean('player', 'autoplay', fallback=True)
 
-    role        = config.get('sync', 'role', fallback='standalone')
+    follow      = config.getboolean('sync', 'role', fallback=False)
     sync_offset = config.getfloat('sync', 'offset', fallback=0.0)
-    sync_id     = config.get('sync', 'id', fallback='default')
+    sync_id     = config.get('sync', 'id', fallback='0')
+    name        = config.get('network', 'name', fallback=DEFAULT_NAME)
 
     buttons = dict(config.items('buttons')) if config.has_section('buttons') else {}
 
-    wall_enabled = config.getboolean('videowall', 'enabled', fallback=False)
-    wall_cols = config.getint('videowall', 'cols', fallback=2)
-    wall_rows = config.getint('videowall', 'rows', fallback=2)
-    try:
-        wall_row, wall_col = (int(x) for x in config.get('videowall', 'position', fallback='0,0').split(','))
-    except ValueError:
-        wall_row, wall_col = 0, 0
-
     return {
-        'audio_device':   AUDIO_DEVICES.get(audio, AUDIO_DEVICES['headphones']),
+        'audio_device': AUDIO_DEVICES[audio],
         'image_duration': image_duration,
         'rotation':       rotation,
-        'role':           role,
+        'force_rotation': force_rotation,
+        'follow':         follow,
         'sync_offset':    sync_offset,
         'sync_id':        sync_id,
+        'name':           name,
         'autoplay':       autoplay,
         'buttons':        buttons,
-        'wall_enabled':   wall_enabled,
-        'wall_cols':      wall_cols,
-        'wall_rows':      wall_rows,
-        'wall_row':       wall_row,
-        'wall_col':       wall_col,
     }
-
-def build_vf(cfg):
-    filters = []
-    if cfg['rotation'] == 90:
-        filters.append('transpose=1')
-    elif cfg['rotation'] == 180:
-        filters += ['hflip', 'vflip']
-    elif cfg['rotation'] == 270:
-        filters.append('transpose=2')
-
-    if cfg['wall_enabled']:
-        cols, rows = cfg['wall_cols'], cfg['wall_rows']
-        col, row   = cfg['wall_col'], cfg['wall_row']
-        filters.append(f'crop=iw/{cols}:ih/{rows}:(iw/{cols})*{col}:(ih/{rows})*{row}')
-
-    return filters
 
 def build_args(cfg):
     args = [
@@ -116,11 +110,20 @@ def build_args(cfg):
         '--input-ipc-server=/tmp/mpv.sock',
         f'--image-display-duration={cfg["image_duration"]}',
     ]
-    vf = build_vf(cfg)
-    if vf:
-        args.append('--vf=lavfi=[' + ','.join(vf) + ']')
-    return args
 
+    if _model in (2, 3) and not cfg['force_rotation']:
+        args.extend([
+            '--vo=gpu',
+            '--gpu-context=drm',
+            '--hwdec=v4l2m2m',
+            '--drm-draw-plane=overlay',
+            '--drm-drmprime-video-plane=primary',
+            '--profile=fast',
+        ])
+    else:
+        args.append(f'--video-rotate={cfg["rotation"]}')
+
+    return args
 COMPOSITE_ARGS = [
     '--drm-connector=Composite-1',
     '--drm-mode=768x576',
@@ -143,14 +146,120 @@ def find_video(name):
 
 def mpv_command(cmd):
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect('/tmp/mpv.sock')
-        s.sendall((json.dumps({'command': cmd}) + '\n').encode())
-        response = json.loads(s.recv(4096))
-        s.close()
-        return response.get('data')
-    except:
-        return None
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect('/tmp/mpv.sock')
+            s.sendall((json.dumps({'command': cmd}) + '\n').encode())
+            s.recv(4096)
+    except OSError:                                  
+        pass
+
+def observer():  # Read data from mpv
+    s = socket.socket(socket.AF_UNIX)
+    for _ in range(50):
+        try:
+            s.connect('/tmp/mpv.sock')
+            break
+        except OSError:
+            time.sleep(0.1)
+    else:
+        return
+    for i, prop in enumerate(OBSERVED, 1):
+        s.sendall((json.dumps({'command': ['observe_property', i, prop]}) + '\n').encode())
+    for line in s.makefile('rb'):
+        msg = json.loads(line)
+        if msg.get('event') != 'property-change':
+            continue
+        now, name, data = time.monotonic(), msg['name'], msg.get('data')
+        PROPS[name] = data
+        if name == 'time-pos':
+            PROPS['_t'] = now
+        elif name == 'path':             
+            PROPS['_t0'] = now
+            PROPS['_pause_at'] = now if PROPS.get('pause') else None
+        elif name == 'pause':
+            if data:
+                PROPS['_pause_at'] = now
+            elif PROPS.get('_pause_at'):
+                PROPS['_t0'] += now - PROPS['_pause_at']
+                PROPS['_pause_at'] = None
+    s.close()
+
+# ---- SHARED STATE ----
+
+CFG = {}
+CURRENT_MEDIA = []    
+PROPS = {}            
+FOLLOWING = ''        
+
+def playerstate():
+    path = PROPS.get('path')
+    ext  = os.path.splitext(path or '')[1].lower()
+
+    if not CURRENT_MEDIA:
+        state = 'N'                                  # no media
+    elif not path or PROPS.get('idle-active'):
+        state = 'B'                                  # black / idle
+    elif PROPS.get('pause'):
+        state = 'H'                                  # paused
+    else:
+        state = 'P'                                  # playing
+
+    kind = '-'
+    if state in ('P', 'H'):
+        kind = 'V' if ext in VIDEO_EXTS else 'A' if ext in AUDIO_EXTS else 'S'
+
+    if kind == 'S':
+        dur = CFG['image_duration']
+        now = time.monotonic()
+        pos = min((PROPS.get('_pause_at') or now) - PROPS.get('_t0', now), dur)
+    elif kind in ('V', 'A'):
+        dur = PROPS.get('duration') or 0
+        tp = PROPS.get('time-pos')
+        pos = 0 if tp is None else tp if PROPS.get('pause') else tp + min(time.monotonic() - PROPS.get('_t', 0), 0.25)   
+    else:
+        dur = pos = 0
+
+    return {
+        'name': CFG['name'], 'sync_id': CFG['sync_id'], 'state': state, 'kind': kind,
+        'index': CURRENT_MEDIA.index(path) + 1 if path in CURRENT_MEDIA else 0,
+        'count': len(CURRENT_MEDIA), 'pos': pos, 'dur': dur, 'left': max(dur - pos, 0),
+        'role': 'F' if CFG['follow'] else 'P',
+        'file': os.path.basename(path) if kind != '-' else '',
+        'source': FOLLOWING,
+    }
+
+def goto(n):
+    if 1 <= n <= len(CURRENT_MEDIA):
+        if PROPS.get('playlist-count') == len(CURRENT_MEDIA):
+            mpv_command(['playlist-play-index', n - 1])
+        else:
+            mpv_command(['loadfile', CURRENT_MEDIA[n - 1], 'replace'])
+
+# ---- COMMANDS ----
+
+def dispatch(action, arg=None):
+    if CFG['follow']:
+        return False
+    if action == 'play':
+        mpv_command(['set_property', 'pause', False])
+    elif action == 'pause':
+        mpv_command(['set_property', 'pause', True])
+    elif action == 'toggle':
+        mpv_command(['cycle', 'pause'])
+    elif action == 'next':
+        mpv_command(['playlist-next'])
+    elif action == 'previous':
+        mpv_command(['playlist-prev'])
+    elif action == 'goto':
+        goto(int(arg))
+    elif action == 'seek':
+        mpv_command(['seek', float(arg), 'absolute'])
+    else:
+        path = find_video(arg if action == 'video' else action)
+        if not path:
+            return False
+        mpv_command(['loadfile', path, 'replace'])
+    return True
 
 # ---- BUTTONS ----
 
@@ -158,71 +267,160 @@ def assign_buttons(cfg):
     for btn in BUTTONS.values():
         btn.when_pressed = None
     for pin, action in cfg['buttons'].items():
-        if int(pin) in BUTTONS:
-            btn = BUTTONS[int(pin)]
-            btn.when_pressed = lambda a=action: handle_button(a)
+        BUTTONS[int(pin)].when_pressed = lambda a=action: dispatch(a)
 
-def handle_button(action):
-    if action in ('play', 'pause'):
-        mpv_command(['cycle', 'pause'])
-    elif action == 'next':
-        mpv_command(['playlist-next'])
-    elif action == 'previous':
-        mpv_command(['playlist-prev'])
-    else:
-        path = find_video(action)
-        if path:
-            mpv_command(['loadfile', path, 'replace'])
+# ---- STATUS PROTOCOL ----
+#   MPI4|1|name|syncid|state|kind|index|count|pos|dur|role|file
+#   MPI4: Always a static name
+#   1: protocol version number. can be checked if future updates break compatibility 
+#   syncid: For multiple sync groups
+#   state: P playing  H paused  B black/idle  N no media
+#   kind:  V video  A audio  S still  - none
+#   count: number of files in playlist
+#   pos/dur in seconds
+#   role:  P Player F follower
+#   File is the rest of the packet (may contain |)
 
-# ---- SYNC ----
+def encode_status(s):
+    return '|'.join(['MPI4', '1', s['name'], s['sync_id'], s['state'], s['kind'],
+                     str(s['index']), str(s['count']), '%.2f' % s['pos'], '%.1f' % s['dur'],
+                     s['role'], s['file'][:40]]).encode()
 
-def leader(player, sync_id):
+def decode_status(data):
+    f = data.decode('utf-8', 'ignore').split('|', 11)
+    if len(f) != 12 or f[0] != 'MPI4' or f[1] != '1':
+        return None
+    return {'name': f[2], 'sync_id': f[3], 'state': f[4], 'kind': f[5], 'index': int(f[6]),
+            'count': int(f[7]), 'pos': float(f[8]), 'dur': float(f[9]), 'role': f[10], 'file': f[11]}
+
+def broadcaster():
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    targets, refreshed = [], 0
-    while player.poll() is None:
-        if time.time() - refreshed > 2:
+    targets, refreshed, last_key, last_sent = [], 0, None, 0
+    while True:
+        now = time.monotonic()
+        if now - refreshed > 2:    
             out = subprocess.run(['ip', '-4', '-o', 'addr', 'show'], capture_output=True, text=True).stdout
-            targets, refreshed = re.findall(r'brd (\S+)', out), time.time()
-        position = mpv_command(['get_property', 'playback-time'])
-        if position is not None:
-            packet = json.dumps({'id': sync_id, 'position': position}).encode()
+            targets, refreshed = re.findall(r'brd (\S+)', out), now
+        s = playerstate()
+        key = (s['state'], s['kind'], s['index'], s['file'], s['role'])
+        if s['state'] == 'P' or key != last_key or now - last_sent >= 1:  
+            packet = encode_status(s)
             for target in targets:
                 try:
-                    udp.sendto(packet, (target, 5005))
+                    udp.sendto(packet, (target, STATUS_PORT))
                 except OSError:
                     pass
+            last_key, last_sent = key, now
         time.sleep(0.1)
-    udp.close()
 
-def follower(player, sync_id, offset):
+# ---- FOLLOWER ----
+
+SYNC = {'last_goto': 0.0, 'nudged': False}
+
+def sync_to(p):
+    me = playerstate()
+    want_pause = p['state'] == 'H'
+    if want_pause != bool(PROPS.get('pause')):
+        mpv_command(['set_property', 'pause', want_pause])
+
+    if p['count'] == me['count'] and p['index'] and p['index'] != me['index']:
+        if time.monotonic() - SYNC['last_goto'] > 1.5:          
+            goto(p['index'])
+            SYNC['last_goto'] = time.monotonic()
+        return
+
+    if p['kind'] == 'S' or me['kind'] not in ('V', 'A') or p['dur'] <= 0 or PROPS.get('time-pos') is None:
+        return
+    current = me['pos']
+    if current is None:
+        return
+    dur  = p['dur']
+    diff = (p['pos'] - CFG['sync_offset'] - current + dur / 2) % dur - dur / 2   
+    if abs(diff) > 0.5:
+        mpv_command(['seek', (current + diff) % dur, 'absolute'])
+    elif abs(diff) > 0.05:
+        mpv_command(['set_property', 'speed', max(0.9, min(1.1, 1.0 + diff * 0.5))])
+        SYNC['nudged'] = True
+    elif SYNC['nudged']:
+        mpv_command(['set_property', 'speed', 1.0])
+        SYNC['nudged'] = False
+
+def follower():
+    global FOLLOWING
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)    
     udp.settimeout(1.0)
-    udp.bind(('', 5005))
-    nudged = False
-    while player.poll() is None:
+    udp.bind(('', STATUS_PORT))
+    sources = {}
+    while True:
         try:
-            data, _ = udp.recvfrom(1024)
-            packet = json.loads(data)
-            if packet.get('id') != sync_id:
-                continue
-            target = packet['position'] - offset
-            current = mpv_command(['get_property', 'playback-time'])
-            if current is None:
-                continue
-            diff = target - current
-            if abs(diff) > 0.5:
-                mpv_command(['seek', target, 'absolute'])
-            elif abs(diff) > 0.05:
-                mpv_command(['set_property', 'speed', max(0.9, min(1.1, 1.0 + diff * 0.5))])
-                nudged = True
-            elif nudged:
-                mpv_command(['set_property', 'speed', 1.0])
-                nudged = False
+            data, _ = udp.recvfrom(512)
         except socket.timeout:
+            data = None
+        if not CFG['follow']:
+            FOLLOWING = ''
             continue
-    udp.close()
+        now = time.monotonic()
+        p = decode_status(data) if data else None
+        if p and p['role'] == 'P' and p['sync_id'] == CFG['sync_id']:
+            sources[p['name']] = (now, p)
+        live = [n for n, (t, _) in sources.items() if now - t < 2]
+        FOLLOWING = min(live) if live else ''
+        if p and p['name'] == FOLLOWING and p['state'] in ('P', 'H'):
+            sync_to(p)
+
+# ---- WEB PAGE + API ----
+
+class Web(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def reply(self, body, ctype='application/json', code=200):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == '/':
+            self.reply(open(HTML_PATH).read(), 'text/html; charset=utf-8')
+        elif path == '/api/status':
+            self.reply(json.dumps(playerstate()))
+        elif path == '/api/playlist':
+            self.reply(json.dumps([os.path.basename(f) for f in CURRENT_MEDIA]))
+        else:
+            self.reply('{}', code=404)
+
+    def do_POST(self):
+        url = urlparse(self.path)
+        if not url.path.startswith('/api/'):
+            return self.reply('{}', code=404)
+        ok = dispatch(url.path[5:], parse_qs(url.query).get('arg', [None])[0])
+        self.reply(json.dumps({'ok': ok}), code=200 if ok else 409)
+
+def web_server():
+    ThreadingHTTPServer(('0.0.0.0', HTTP_PORT), Web).serve_forever()
+
+# ---- OSC IN ----
+# /mpi4/<action> [arg]            -> whoever receives it
+# /mpi4/<name>/<action> [arg]     -> only players whose name matches (wildcards allowed: /mpi4/wall-*/pause)
+
+def osc_handler(address, *args):
+    parts = address.strip('/').split('/')
+    if parts[0] != 'mpi4' or len(parts) not in (2, 3):
+        return
+    if len(parts) == 3 and not fnmatchcase(CFG['name'], parts[1]):
+        return
+    dispatch(parts[-1], args[0] if args else None)
+
+def osc_server():
+    osc = Dispatcher()
+    osc.set_default_handler(osc_handler)
+    ThreadingOSCUDPServer(('0.0.0.0', OSC_PORT), osc).serve_forever()
 
 # ---- WATCHER ----
 
@@ -232,31 +430,41 @@ def watcher(player, current_media):
         if get_media() != current_media:
             player.terminate()
 
+# ---- SERVICES ----
+
+def keep_alive(service):
+    while True:
+        try:
+            service()
+        except Exception as e:
+            print(f'{service.__name__} stopped ({e!r}), restarting')
+            time.sleep(1)
+
+CFG = load_config()
+for service in (broadcaster, follower, web_server, osc_server):
+    threading.Thread(target=keep_alive, args=(service,), daemon=True).start()
+
 # ---- MAIN LOOP ----
 
 while True:
-    cfg = load_config()
-    assign_buttons(cfg)
-    media = get_media()
-    args  = build_args(cfg)
+    CFG = load_config()
+    assign_buttons(CFG)
+    media = CURRENT_MEDIA = get_media()
+    PROPS.clear()
+    args  = build_args(CFG)
     if USE_COMPOSITE:
         args += COMPOSITE_ARGS
 
     if not media:
         player = subprocess.Popen(['mpv'] + args + ['--loop-playlist=inf'] + [NOMEDIA_IMAGE])
 
-    elif cfg['autoplay']:
+    elif CFG['autoplay']:
         player = subprocess.Popen(['mpv'] + args + ['--loop-playlist=inf'] + media)
 
     else:
         player = subprocess.Popen(['mpv'] + args + ['--idle=yes', '--keep-open=no'])
 
+    threading.Thread(target=observer, daemon=True).start()
     threading.Thread(target=watcher, args=(player, media), daemon=True).start()
-
-    if cfg['role'] == 'leader':
-        threading.Thread(target=leader, args=(player, cfg['sync_id']), daemon=True).start()
-
-    elif cfg['role'] == 'follower':
-        threading.Thread(target=follower, args=(player, cfg['sync_id'], cfg['sync_offset']), daemon=True).start()
 
     player.wait()

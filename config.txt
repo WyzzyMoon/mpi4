@@ -1,4 +1,4 @@
-# mpi4 config
+# mpi4_v1-rc1 config
 
 disable_splash=1
 avoid_warnings=1

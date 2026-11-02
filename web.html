@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mπ4</title>
+
+  <style>
+    body {
+      background: #222;
+      color: #ccc;
+      font-family: monospace;
+      max-width: 480px;
+      margin: 2em auto;
+      padding: 0 1em;
+    }
+
+    h1 {
+      color: #fff;
+      font-size: 1.2em;
+    }
+
+    #controls {
+      border: 0;
+      padding: 0;
+      margin: 1em 0;
+    }
+
+    #seek {
+      display: block;
+      width: 100%;
+      margin: 8px 0 14px;
+      background: transparent;
+      -webkit-appearance: none;
+      appearance: none;
+      cursor: pointer;
+    }
+
+    #seek:disabled {
+      opacity: .4;
+      cursor: default;
+    }
+
+    #seek::-webkit-slider-runnable-track {
+      height: 2px;
+      background: #666;
+    }
+
+    #seek::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 10px;
+      height: 18px;
+      margin-top: -8px;
+      background: #fff;
+      border: 0;
+      border-radius: 0;
+    }
+
+    #seek::-moz-range-track {
+      height: 2px;
+      background: #666;
+    }
+
+    #seek::-moz-range-thumb {
+      width: 10px;
+      height: 18px;
+      background: #fff;
+      border: 0;
+      border-radius: 0;
+    }
+
+    button {
+      font: inherit;
+      padding: .6em 1.2em;
+      margin: 2px;
+      background: #444;
+      color: #fff;
+      border: 0;
+    }
+
+    button:disabled {
+      opacity: .4;
+    }
+
+    ol {
+      padding: 0;
+      list-style: inside decimal;
+    }
+
+    li {
+      cursor: pointer;
+      padding: 2px 0;
+    }
+
+    li.on {
+      color: #fff;
+      font-weight: bold;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h1 id="name">…</h1>
+  <p id="info"></p>
+
+  <fieldset id="controls">
+    <input type="range" id="seek" min="0" max="1" step="any" value="0" disabled>
+
+    <button onclick="send('previous')">⏮</button>
+    <button onclick="send('toggle')">⏯</button>
+    <button onclick="send('next')">⏭</button>
+  </fieldset>
+
+  <ol id="list"></ol>
+
+  <script>
+    const nameEl   = document.getElementById('name');
+    const infoEl   = document.getElementById('info');
+    const controls = document.getElementById('controls');
+    const seek     = document.getElementById('seek');
+    const list     = document.getElementById('list');
+
+    const stateWords = {
+      P: 'playing',
+      H: 'paused',
+      B: 'idle',
+      N: 'no media'
+    };
+
+    let lastCount = -1; 
+    let scrubbing = false; 
+
+
+    // Seconds -> m:ss
+    function formatTime(seconds) {
+      seconds = Math.round(seconds);
+      const minutes = Math.floor(seconds / 60);
+      const rest    = ('0' + seconds % 60).slice(-2);
+      return minutes + ':' + rest;
+    }
+
+    function send(action, arg) {
+      let url = '/api/' + action;
+      if (arg !== undefined) url += '?arg=' + encodeURIComponent(arg); 
+      fetch(url, { method: 'POST' });
+    }
+
+    seek.addEventListener('pointerdown', () => scrubbing = true);
+
+    ['pointerup', 'pointercancel'].forEach(type => {
+      document.addEventListener(type, () => {
+        if (scrubbing) setTimeout(() => scrubbing = false, 1000);
+      });
+    });
+
+    seek.addEventListener('change', () => send('seek', seek.value));
+
+
+    // Rebuild the playlist
+    function loadList() {
+      fetch('/api/playlist')
+        .then(response => response.json())
+        .then(files => {
+          list.innerHTML = '';
+
+          files.forEach((file, i) => {
+            const li = document.createElement('li');
+            li.textContent = file;
+            li.onclick = () => send('goto', i + 1);
+            list.appendChild(li);
+          });
+        });
+    }
+
+    function tick() {
+      fetch('/api/status')
+        .then(response => response.json())
+        .then(status => {
+
+          const following = (status.role == 'F');
+          let title = status.name;
+          if (following) title += ' (following ' + (status.source || '...') + ')';
+          nameEl.textContent = title;
+
+
+          let info = stateWords[status.state] + '  ' + status.file;
+          if (status.dur) {
+            info += '  ' + formatTime(status.pos) + ' / ' + formatTime(status.dur)
+                  + '  (-' + formatTime(status.left) + ')';
+          }
+          infoEl.textContent = info;
+
+
+          controls.disabled = following;
+
+          seek.disabled = !status.dur;
+          if (!scrubbing) {
+            seek.max   = status.dur || 1;
+            seek.value = status.pos || 0;
+          }
+
+
+          if (status.count != lastCount) {
+            lastCount = status.count;
+            loadList();
+          }
+
+
+          list.querySelectorAll('li').forEach((li, i) => {
+            li.classList.toggle('on', i + 1 == status.index);
+          });
+        })
+        .catch(() => {}); 
+    }
+
+
+    setInterval(tick, 500);
+    tick();
+  </script>
+
+</body>
+</html>
